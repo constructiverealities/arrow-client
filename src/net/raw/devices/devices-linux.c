@@ -83,6 +83,9 @@ struct net_device * net_find_devices() {
     for (ifaddr = ifaddrs; ifaddr != NULL; ifaddr = ifaddr->ifa_next) {
         if (!ifaddr->ifa_addr)
             continue;
+        /* Skip interfaces that are not up; pcap cannot use them. */
+        if (!(ifaddr->ifa_flags & IFF_UP))
+            continue;
 
         tmp = get_device_info(fd, ifaddr);
         if (tmp) {

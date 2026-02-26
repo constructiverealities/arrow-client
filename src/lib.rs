@@ -52,6 +52,9 @@ pub mod runtime;
 #[doc(hidden)]
 pub mod scanner;
 
+#[cfg(feature = "discovery")]
+pub mod output;
+
 pub mod storage;
 
 #[doc(hidden)]

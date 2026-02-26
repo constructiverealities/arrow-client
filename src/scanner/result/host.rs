@@ -56,12 +56,12 @@ impl HostRecord {
     }
 
     /// Get port iterator.
-    pub fn ports(&self) -> PortIterator {
+    pub fn ports(&self) -> PortIterator<'_> {
         PortIterator::new(self)
     }
 
     /// Get socket address iterator.
-    pub fn socket_addrs(&self) -> SocketAddrIterator {
+    pub fn socket_addrs(&self) -> SocketAddrIterator<'_> {
         SocketAddrIterator::new(self)
     }
 }

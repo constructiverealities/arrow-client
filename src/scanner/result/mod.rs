@@ -72,17 +72,17 @@ impl ScanResult {
     }
 
     /// Get host records.
-    pub fn hosts(&self) -> HostRecordIterator {
+    pub fn hosts(&self) -> HostRecordIterator<'_> {
         HostRecordIterator::new(self)
     }
 
     /// Get socket addresses.
-    pub fn socket_addrs(&self) -> SocketAddrIterator {
+    pub fn socket_addrs(&self) -> SocketAddrIterator<'_> {
         SocketAddrIterator::new(self)
     }
 
     /// Get services.
-    pub fn services(&self) -> ServiceIterator {
+    pub fn services(&self) -> ServiceIterator<'_> {
         ServiceIterator::new(self)
     }
 

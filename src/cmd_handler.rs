@@ -237,16 +237,23 @@ fn network_scanner_thread(mut app_context: ApplicationContext) {
         &mut logger,
         Severity::WARN,
         "network scanner error",
-        discovery::scan_network(slogger, discovery_whitelist, rtsp_paths, mjpeg_paths),
+        discovery::scan_network(
+            slogger,
+            discovery_whitelist,
+            rtsp_paths,
+            mjpeg_paths,
+            false,
+            std::time::Duration::from_millis(50),
+        ),
     );
 
-    if let Some(result) = result {
-        let services = result.services().cloned().collect::<Vec<_>>();
+    if let Some((scan_result, _survey)) = result {
+        let services = scan_result.services().cloned().collect::<Vec<_>>();
 
         let count = services.len();
 
         app_context.update_service_table(services);
-        app_context.set_scan_result(result);
+        app_context.set_scan_result(scan_result);
 
         log_info!(
             logger,

@@ -90,21 +90,40 @@ impl From<io::Error> for DiscoveryError {
 /// Discovery result type alias.
 pub type Result<T> = result::Result<T, DiscoveryError>;
 
+/// Survey data: per-address list of (path, result) for diagnostic output.
+/// Key is "host:port", result is "supported" | "locked" | "unsupported" | "not_found" | "error".
+pub type SurveyData = std::collections::HashMap<String, Vec<(String, String)>>;
+
 /// Scan all local networks for RTSP and MJPEG streams and associated HTTP
 /// services.
+/// When `verbose` is true, returns survey data (per-address, per-path results) for the discovery block.
 pub fn scan_network(
     logger: BoxLogger,
     discovery_whitelist: Arc<HashSet<String, RandomState>>,
     rtsp_paths: Arc<Vec<String>>,
     mjpeg_paths: Arc<Vec<String>>,
-) -> Result<ScanResult> {
+    verbose: bool,
+    path_delay: Duration,
+) -> Result<(ScanResult, Option<SurveyData>)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
         .map_err(|err| DiscoveryError::new(format!("Async IO error: {}", err)))?;
 
-    let context = Context::new(logger, discovery_whitelist, rtsp_paths, mjpeg_paths);
+    let survey = if verbose {
+        Some(Arc::new(std::sync::Mutex::new(SurveyData::new())))
+    } else {
+        None
+    };
+    let context = Context::new(
+        logger,
+        discovery_whitelist,
+        rtsp_paths,
+        mjpeg_paths,
+        path_delay,
+        survey.clone(),
+    );
 
     let rtsp_port_priorities = context.get_rtsp_port_priorities();
     let http_port_priorities = context.get_http_port_priorities();
@@ -141,7 +160,12 @@ pub fn scan_network(
         report.add_service(Service::http(mac, saddr));
     }
 
-    Ok(report)
+    let survey_data = survey
+        .as_ref()
+        .and_then(|s| s.lock().ok())
+        .map(|g| g.clone());
+
+    Ok((report, survey_data))
 }
 
 /// Internal data for the network scanner context.
@@ -156,6 +180,8 @@ struct ContextData {
     rtsp_paths: Arc<Vec<String>>,
     mjpeg_paths: Arc<Vec<String>>,
     request_timeout: Duration,
+    path_delay: Duration,
+    survey: Option<Arc<std::sync::Mutex<SurveyData>>>,
 }
 
 impl ContextData {
@@ -165,6 +191,8 @@ impl ContextData {
         discovery_whitelist: Arc<HashSet<String>>,
         rtsp_paths: Arc<Vec<String>>,
         mjpeg_paths: Arc<Vec<String>>,
+        path_delay: Duration,
+        survey: Option<Arc<std::sync::Mutex<SurveyData>>>,
     ) -> Self {
         let mut port_candidates = HashSet::<u16>::new();
         let mut rtsp_port_candidates = HashSet::<u16>::new();
@@ -190,6 +218,8 @@ impl ContextData {
             rtsp_paths,
             mjpeg_paths,
             request_timeout: Duration::from_millis(2000),
+            path_delay,
+            survey,
         }
     }
 }
@@ -222,6 +252,8 @@ impl Context {
         discovery_whitelist: Arc<HashSet<String>>,
         rtsp_paths: Arc<Vec<String>>,
         mjpeg_paths: Arc<Vec<String>>,
+        path_delay: Duration,
+        survey: Option<Arc<std::sync::Mutex<SurveyData>>>,
     ) -> Self {
         Self {
             data: Arc::new(ContextData::new(
@@ -229,7 +261,20 @@ impl Context {
                 discovery_whitelist,
                 rtsp_paths,
                 mjpeg_paths,
+                path_delay,
+                survey,
             )),
+        }
+    }
+
+    /// Record a path probe result for survey output (no-op when not verbose).
+    fn record_survey(&self, addr: &SocketAddr, path: &str, result: &str) {
+        if let Some(s) = &self.data.survey {
+            if let Ok(mut g) = s.lock() {
+                g.entry(format!("{}", addr))
+                    .or_default()
+                    .push((path.to_string(), result.to_string()));
+            }
         }
     }
 
@@ -241,6 +286,11 @@ impl Context {
     /// Get request timeout.
     fn get_request_timeout(&self) -> Duration {
         self.data.request_timeout
+    }
+
+    /// Get delay between path probes on the same host (0 = no throttle).
+    fn get_path_delay(&self) -> Duration {
+        self.data.path_delay
     }
 
     /// Get all port candidates.
@@ -410,7 +460,7 @@ impl From<RtspResponse> for StreamType {
             } else {
                 Self::Unsupported
             }
-        } else if status_code == 401 {
+        } else if status_code == 401 || status_code == 403 {
             Self::Locked
         } else if status_code == 404 {
             Self::NotFound
@@ -430,13 +480,41 @@ impl From<HttpResponse> for StreamType {
             } else {
                 Self::Unsupported
             }
-        } else if status_code == 401 {
+        } else if status_code == 401 || status_code == 403 {
             Self::Locked
         } else if status_code == 404 {
             Self::NotFound
         } else {
             Self::Error
         }
+    }
+}
+
+fn stream_type_to_result(st: StreamType) -> &'static str {
+    match st {
+        StreamType::Supported => "supported",
+        StreamType::Locked => "locked",
+        StreamType::Unsupported => "unsupported",
+        StreamType::NotFound => "not_found",
+        StreamType::Error => "error",
+    }
+}
+
+/// Map HTTP response to StreamType without consuming (for survey recording).
+fn http_response_to_stream_type(r: &HttpResponse) -> StreamType {
+    let status_code = r.status_code();
+    if status_code == 200 {
+        if is_supported_mjpeg_service(r) {
+            StreamType::Supported
+        } else {
+            StreamType::Unsupported
+        }
+    } else if status_code == 401 || status_code == 403 {
+        StreamType::Locked
+    } else if status_code == 404 {
+        StreamType::NotFound
+    } else {
+        StreamType::Error
     }
 }
 
@@ -642,7 +720,13 @@ async fn find_rtsp_stream(context: Context, mac: MacAddr, addr: SocketAddr) -> S
 
     let mut res = Service::unknown_rtsp(mac, addr);
 
-    for path in paths.iter() {
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            let delay = context.get_path_delay();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let service = get_rtsp_stream(context.clone(), mac, addr, path);
 
         if let Some(svc) = service.await {
@@ -668,12 +752,13 @@ async fn get_rtsp_stream(
 ) -> Option<Service> {
     let path = path.to_string();
 
-    let stream_type = get_rtsp_stream_type(context, addr, &path);
+    let stream_type = get_rtsp_stream_type(context.clone(), addr, &path).await;
+    context.record_survey(&addr, &path, stream_type_to_result(stream_type));
 
-    match stream_type.await {
+    match stream_type {
         StreamType::Supported => Some(Service::rtsp(mac, addr, path)),
         StreamType::Unsupported => Some(Service::unsupported_rtsp(mac, addr, path)),
-        StreamType::Locked => Some(Service::locked_rtsp(mac, addr, None)),
+        StreamType::Locked => Some(Service::locked_rtsp(mac, addr, Some(path))),
 
         _ => None,
     }
@@ -736,7 +821,13 @@ where
 async fn find_mjpeg_path(context: Context, mac: MacAddr, addr: SocketAddr) -> Option<Service> {
     let paths = context.get_mjpeg_paths();
 
-    for path in paths.iter() {
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            let delay = context.get_path_delay();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let service = get_mjpeg_stream(context.clone(), mac, addr, path);
 
         if let Some(svc) = service.await {
@@ -756,15 +847,21 @@ async fn get_mjpeg_stream(
 ) -> Option<Service> {
     let path = path.to_string();
 
-    get_http_response(context, addr, &path)
-        .await
-        .map(|response| match StreamType::from(response) {
+    let response = get_http_response(context.clone(), addr, &path).await;
+    let st = response
+        .as_ref()
+        .map(http_response_to_stream_type)
+        .unwrap_or(StreamType::Error);
+    context.record_survey(&addr, &path, stream_type_to_result(st));
+
+    response
+        .ok()
+        .and_then(|r| match StreamType::from(r) {
             StreamType::Supported => Some(Service::mjpeg(mac, addr, path)),
-            StreamType::Locked => Some(Service::locked_mjpeg(mac, addr, None)),
+            StreamType::Locked => Some(Service::locked_mjpeg(mac, addr, Some(path))),
 
             _ => None,
         })
-        .unwrap_or(None)
 }
 
 #[cfg(test)]
